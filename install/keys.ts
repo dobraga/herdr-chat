@@ -21,15 +21,15 @@
 //
 //   node install/keys.ts install <app home> [--no-direct] [--platform darwin|linux]
 //   node install/keys.ts uninstall <app home>
-import { existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, realpathSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { keyLabel } from "../herdr-app/mods/chat/chord.js";
 
 type Json = any;
-export const NAMES = ["open", "pi", "claude", "codex", "continue"] as const;
+export const NAMES = ["open", "pi", "claude", "codex", "agy", "continue"] as const;
 export type Name = (typeof NAMES)[number];
-export const ACTION: Record<Name, string> = { open: "mod.open:new-chat", pi: "new-chat.pi", claude: "new-chat.claude", codex: "new-chat.codex", continue: "new-chat.continue" };
-export const TITLE: Record<Name, string> = { open: "New chat", pi: "Pi chat", claude: "Claude Code chat", codex: "Codex chat", continue: "Continue as chat" };
+export const ACTION: Record<Name, string> = { open: "mod.open:new-chat", pi: "new-chat.pi", claude: "new-chat.claude", codex: "new-chat.codex", agy: "new-chat.agy", continue: "new-chat.continue" };
+export const TITLE: Record<Name, string> = { open: "New chat", pi: "Pi chat", claude: "Claude Code chat", codex: "Codex chat", agy: "Antigravity chat", continue: "Continue as chat" };
 
 export type Own = { [chord: string]: { action: string; was: string | null } };
 export type Record2 = { version: 2; global: Own };
@@ -118,18 +118,19 @@ export function summary(bound: Partial<Record<Name, string>>, platform: string):
   return parts.length ? parts.join(" · ") : "New chat: no key (Herdr's mod.open:new-chat opens it)";
 }
 
-/** Read keys.json, change it, replace it whole unless it changed meanwhile. Returns whether it wrote. */
+/** Read keys.json, change it, replace it whole unless it changed meanwhile. Preserves symlinks. Returns whether it wrote. */
 function editKeys(path: string, edit: (doc: Json) => void): boolean {
+  const target = existsSync(path) ? realpathSync(path) : path;
   for (let i = 0; i < 5; i++) {
-    const before = existsSync(path) ? readFileSync(path, "utf8") : null;
+    const before = existsSync(target) ? readFileSync(target, "utf8") : null;
     const doc = before === null ? {} : JSON.parse(before);
     const was = JSON.stringify(doc);
     edit(doc);
     if (JSON.stringify(doc) === was) return false;
-    const tmp = join(path, "..", ".keys.json.herdr-chat.tmp");
+    const tmp = join(target, "..", ".keys.json.herdr-chat.tmp");
     writeFileSync(tmp, JSON.stringify(doc, null, 2) + "\n");
-    if ((existsSync(path) ? readFileSync(path, "utf8") : null) !== before) { rmSync(tmp, { force: true }); continue; }
-    renameSync(tmp, path);
+    if ((existsSync(target) ? readFileSync(target, "utf8") : null) !== before) { rmSync(tmp, { force: true }); continue; }
+    renameSync(tmp, target);
     return true;
   }
   throw new Error(`${path} keeps changing; run the install again`);
