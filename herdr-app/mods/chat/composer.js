@@ -302,7 +302,7 @@ export class Composer {
       .bg(stop ? t.foreground : typed ? t.solid : t.raised)
       .text_color(stop ? t.background : typed ? t.solid_foreground : t.dim)
       .hover((s) => s.opacity(0.85))
-      .tooltip(stop ? `Stop (Esc${stopKey ? ` · ${stopKey}` : ""})` : working ? "Steer (Enter)" : "Send (Enter)")
+      .tooltip(stop ? `Stop (Esc${stopKey ? ` · ${stopKey}` : ""})` : working ? (c.canSteer === false ? "Queue (Enter)" : "Steer (Enter)") : "Send (Enter)")
       .on_click((_e, cx) => c.action(stop ? "herdrchat_stop" : "herdrchat_enter", cx))
       .child(icon(stop ? "square" : "arrow-up", stop ? 11 : 15));
     return v_flex().w_full().rounded(14).border_1().border_color(this.focused ? alpha(t.accent, 0.55) : t.input).bg(t.surface)

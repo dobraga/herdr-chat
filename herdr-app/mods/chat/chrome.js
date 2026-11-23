@@ -194,8 +194,9 @@ export function queueLabels(s) {
     const who = from ?? env.from;
     return who ? [`Report from ${who}`, (env.from ? env.text : x).trim()] : [k, x];
   };
+  const followLabel = s.capabilities?.steer === false ? "Queued" : "Follow-up";
   return [...s.queue.steering.map((x, i) => label("Steer", x, s.queue.steeringFrom?.[i])),
-    ...s.queue.followUp.map((x, i) => label("Follow-up", x, s.queue.followUpFrom?.[i]))];
+    ...s.queue.followUp.map((x, i) => label(followLabel, x, s.queue.followUpFrom?.[i]))];
 }
 
 // The two lanes just above the composer (protocol v3.2), each first in,
@@ -205,11 +206,13 @@ export function queueLabels(s) {
 // A report's row says who sent it.
 export function queueChips(v, s, t) {
   const q = s.queue ?? {};
+  const canSteer = s.capabilities?.steer !== false;
   const lane = (kind, texts, ids, removable, from, color, iconName, title) => {
     if (!texts?.length) return null;
     const rows = texts.map((x, i) => {
       const id = ids?.[i] ?? null;
       const can = Boolean(id && removable?.[i]);
+      const canMove = can && (kind === "steer" || canSteer);
       const env = unwrapHc(x);
       const who = from?.[i] ?? env.from;
       const text = (env.from ? env.text : x).trim();
@@ -223,9 +226,8 @@ export function queueChips(v, s, t) {
           .on_click((_e, cx) => v.control(`queue:edit:${id}`, cx)))
         .when(Boolean(who), (e) => e.child(div().flex_none().text_color(t.dim).child(`Report from ${who}`)))
         .child(div().flex_1().min_w(0).truncate().text_color(t.foreground).child(text))
-        .when(can, (e) => e
-          .child(btn("move", kind === "steer" ? "Move to the follow-ups (after this run)" : "Steer with it now (next turn)", "move"))
-          .child(btn("remove", "Remove from the queue", "remove")));
+        .when(canMove, (e) => e.child(btn("move", kind === "steer" ? "Move to the follow-ups (after this run)" : "Steer with it now (next turn)", "move")))
+        .when(can, (e) => e.child(btn("remove", "Remove from the queue", "remove")));
     });
     return v_flex().w_full().rounded(10).border_1().border_color(alpha(color, 0.35)).bg(alpha(color, 0.07)).overflow_hidden()
       .child(h_flex().h(22).px(10).gap(6).items_center().text_size(11).text_color(color)
@@ -233,7 +235,7 @@ export function queueChips(v, s, t) {
       .children(rows);
   };
   const steer = lane("steer", q.steering, q.steeringIds, q.steeringRemovable, q.steeringFrom, t.ansi4, "corner-up-right", "Steer: next turn");
-  const follow = lane("followUp", q.followUp, q.followUpIds, q.followUpRemovable, q.followUpFrom, t.ansi3, "clock", "Follow-up: after this run");
+  const follow = lane("followUp", q.followUp, q.followUpIds, q.followUpRemovable, q.followUpFrom, t.ansi3, "clock", canSteer ? "Follow-up: after this run" : "Queued: after this run");
   if (!steer && !follow) return null;
   return v_flex().w_full().gap(6).children([steer, follow].filter(Boolean));
 }

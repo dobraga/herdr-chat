@@ -9,6 +9,7 @@ let currentModel = "gemini-4-neon";
 let currentThought = "high";
 let currentMode = "default";
 let activePromptId = null;
+let activeTimer = null;
 let pendingPermission = null;
 let lastPromptParams = null;
 
@@ -207,6 +208,10 @@ rl.on("line", (line) => {
     }
 
     case "session/cancel": {
+      if (activeTimer) {
+        clearTimeout(activeTimer);
+        activeTimer = null;
+      }
       if (activePromptId !== null) {
         const pid = activePromptId;
         activePromptId = null;
@@ -217,10 +222,48 @@ rl.on("line", (line) => {
     }
 
     case "session/prompt": {
+      if (activePromptId !== null) {
+        send({ jsonrpc: "2.0", id: msg.id, error: { code: -32000, message: "already running a prompt" } });
+        break;
+      }
       const sid = msg.params?.sessionId;
       const text = (msg.params?.prompt ?? []).find((b) => b.type === "text")?.text ?? "";
       lastPromptParams = msg.params;
       activePromptId = msg.id;
+
+      if (text.includes("SLOW")) {
+        const callId = `call_slow_${msg.id}`;
+        update(sid, {
+          sessionUpdate: "tool_call",
+          toolCallId: callId,
+          name: "run_command",
+          args: { CommandLine: "sleep 1" },
+          status: "in_progress",
+        });
+        activeTimer = setTimeout(() => {
+          activeTimer = null;
+          if (activePromptId !== msg.id) return;
+          update(sid, {
+            sessionUpdate: "tool_call_update",
+            toolCallId: callId,
+            name: "run_command",
+            status: "completed",
+            rawOutput: { output: "done\n", exit_code: 0 },
+            content: [{ type: "content", content: { type: "text", text: "done\n" } }],
+          });
+          update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ok: ${text}` } });
+          activePromptId = null;
+          send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn", usage: { inputTokens: 100, outputTokens: 20 } } });
+        }, 400);
+        break;
+      }
+
+      if (text.startsWith("ECHO:")) {
+        update(sid, { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `ok: ${text.slice(5).trim()}` } });
+        activePromptId = null;
+        send({ jsonrpc: "2.0", id: msg.id, result: { stopReason: "end_turn", usage: { inputTokens: 50, outputTokens: 10 } } });
+        break;
+      }
 
       if (text.includes("ASK_PERM")) {
         update(sid, {

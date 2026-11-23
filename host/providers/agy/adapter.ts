@@ -519,7 +519,7 @@ export class AgyAdapter implements ProviderAdapter {
     const proc = this.require();
     const sessionId = this.requireSession();
     if (this.activePrompt || p.busy) {
-      throw new AgentError("Antigravity is already running a turn. Queue a follow-up (Alt+Enter) or press Esc to stop.");
+      throw new AgentError("Antigravity is already running a turn (mid-turn steering is not supported). Wait for it to finish or press Esc to stop.");
     }
 
     const blocks: Rec[] = [];
@@ -548,17 +548,19 @@ export class AgyAdapter implements ProviderAdapter {
       (res) => {
         if (this.proc !== proc) return;
         this.activePrompt = false;
-        const stopReason = this.aborting ? "aborted" : mapStopReason(res?.stopReason);
+        const wasAborting = this.aborting;
+        this.aborting = false;
+        const stopReason = wasAborting ? "aborted" : mapStopReason(res?.stopReason);
         const usage = mapUsage(res?.usage);
         this.emitAll(this.mapper.finishTurn({ stopReason, model: this.modelRef(), usage }));
         this.emit({ type: "turn_end" });
         this.emit({ type: "run_settled", aborted: stopReason === "aborted" });
-        this.aborting = false;
       },
       (err) => {
         if (this.proc !== proc) return;
         this.activePrompt = false;
         const aborted = this.aborting;
+        this.aborting = false;
         const exited = err instanceof AgyRpcError && err.agentExited;
         if (!exited) {
           this.emitAll(this.mapper.finishTurn({
@@ -569,7 +571,6 @@ export class AgyAdapter implements ProviderAdapter {
           this.emit({ type: "turn_end" });
           this.emit({ type: "run_settled", aborted });
         }
-        this.aborting = false;
       },
     );
 

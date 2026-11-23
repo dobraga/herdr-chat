@@ -1179,7 +1179,7 @@ export default class HerdrChat extends View {
         this.toComposer(d?.text ?? "", (d?.images ?? []).map((path) => ({ path })));
         this.editingQueued = { lane };
         const k = chordOf("steer") === "enter" || !chordOf("steer") ? "Enter" : keyHint("steer");
-        this.flash(lane === "followUp" ? `Editing a follow-up: ${k} queues it again` : `Editing a steer: ${k} steers with it`, cx);
+        this.flash(lane === "followUp" ? (this.caps()?.steer === false ? `Editing a queued message: ${k} queues it again` : `Editing a follow-up: ${k} queues it again`) : `Editing a steer: ${k} steers with it`, cx);
         this.debug.mark();
       });
     }
@@ -2235,10 +2235,11 @@ export default class HerdrChat extends View {
     const keyName = (a, plain) => (chordOf(a) === "enter" ? plain : keyHint(a));
     const sendKey = keyName("steer", "Enter");
     const followKey = keyName("followUp", null);
+    const canSteer = s.capabilities?.steer !== false;
     const hintText = this.flashText?.text ?? (s.dialog ? (s.dialog.method === "permission" ? "Answer above · Esc denies" : "Answer above · Esc cancels") : working
-      ? [sendKey && `${sendKey} ${s.capabilities?.steer === false ? "queues" : "steers"}`, followKey && `${followKey} after this run`, "Esc stops"].filter(Boolean).join(" · ")
+      ? [sendKey && `${sendKey} ${canSteer ? "steers" : "queues"}`, canSteer && followKey && `${followKey} after this run`, "Esc stops"].filter(Boolean).join(" · ")
       : this.composer.focused && !this.composer.value ? [sendKey && `${sendKey} sends`, "Shift+Enter new line", "/ commands", "@ files", this.peekMode && "Esc closes"].filter(Boolean).join(" · ") : null);
-    const composer = Popup.new("composer-anchor", this.composer.view(t, { ...c, working, footer, action: (a, cx) => this.action(a, cx) }))
+    const composer = Popup.new("composer-anchor", this.composer.view(t, { ...c, working, canSteer, footer, action: (a, cx) => this.action(a, cx) }))
       .anchor("bottom_left").w_full()
       .when(Boolean(menu), (e) => e.content(div().w(this.colW()).pb(8).child(menu)));
     // Its height is in the dump: an open menu must not change it (an overlay, not the flow).

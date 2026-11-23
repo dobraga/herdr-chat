@@ -194,6 +194,7 @@ export class Chat {
   /** Follow-ups the host holds: the next goes as a prompt when the run settles, one per run. */
   private held: Held[] = [];
   private heldSending = false;
+  private sendPreparing = false;
   private retryNotice: string | null = null;
   private compactionNotice: string | null = null;
   private onceRun = new Map<string, number>(); // notice key -> the run it was shown in
@@ -803,7 +804,7 @@ export class Chat {
 
   /** Idle with follow-ups held: send the next one as a prompt. One per run; the next waits for this one's run to settle. */
   private drainHeld(): void {
-    if (this.busy || this.heldSending || !this.held.length || !this.adapter.alive) return;
+    if (this.busy || this.heldSending || this.sendPreparing || !this.held.length || !this.adapter.alive) return;
     // Until `send` answers (it may wait for images before the phase says working), no second one goes.
     this.heldSending = true;
     const h = this.held.shift()!;
@@ -814,7 +815,7 @@ export class Chat {
       returned = true;
       this.returnToComposer([h.text]);
     };
-    this.send({ text: h.text, images: h.images, mode: "auto", source: "queued", from: h.from }, { onRejected: giveBack })
+    this.send({ text: h.text, images: h.images, mode: "auto", source: "queued", from: h.from }, { onRejected: giveBack, fromHeld: true })
       .catch((e) => {
         if (!returned) this.notice("error", `Could not send the follow-up: ${errText(e)}`);
         giveBack();
@@ -1101,20 +1102,29 @@ export class Chat {
     return this.runActive || this.state.phase === "working" || this.state.phase === "compacting";
   }
 
+  private shouldHold(mode: string | undefined): boolean {
+    return mode === "followUp" || (mode !== "steer" && !this.state.capabilities.steer && this.state.capabilities.followUp);
+  }
+
+  private enqueueHeld(text: string, images: string[], from?: string): { disposition: "queued" } {
+    this.held.push({ id: randomUUID(), text, images, ...(from ? { from } : {}) });
+    this.publishQueue();
+    return { disposition: "queued" };
+  }
+
   /**
    * `onRejected`: the agent refused the message after it was sent, or exited before it replied (the
    * timeline item is gone again). `unheard`: `send` has answered without an error (`pending`), so its
    * caller won't learn of it: the caller gives the text back if it is anyone's to keep.
    */
-  async send(args: { text?: string; images?: string[]; mode?: string; source?: UserSource; from?: string }, opts: { onRejected?: (unheard: boolean) => void } = {}): Promise<{ disposition: string }> {
+  async send(args: { text?: string; images?: string[]; mode?: string; source?: UserSource; from?: string }, opts: { onRejected?: (unheard: boolean) => void; fromHeld?: boolean } = {}): Promise<{ disposition: string }> {
     const text = String(args.text ?? "");
     const imagePaths = Array.isArray(args.images) ? args.images.map(String) : [];
     if (!text.trim() && !imagePaths.length) throw new Error("Nothing to send");
-    // A follow-up while working: the host holds it (a command too: it runs after the run) and sends it when the run settles.
-    if (args.mode === "followUp" && this.busy && this.adapter.alive) {
-      this.held.push({ id: randomUUID(), text, images: imagePaths, ...(args.from ? { from: args.from } : {}) });
-      this.publishQueue();
-      return { disposition: "queued" };
+    const queuedBusy = () => this.busy || this.sendPreparing || (!opts.fromHeld && this.heldSending);
+    // An explicit follow-up while working: the host holds it (a command too: it runs after the run) and sends it when the run settles.
+    if (!opts.fromHeld && args.mode === "followUp" && queuedBusy() && this.adapter.alive) {
+      return this.enqueueHeld(text, imagePaths, args.from);
     }
     const builtin = imagePaths.length ? null : parseBuiltin(text, this.state.commands.filter((c) => c.source === "builtin"));
     if (builtin) {
@@ -1123,19 +1133,40 @@ export class Chat {
       if (builtin.name !== "compact") this.drainHeld();
       return { disposition: "handled" };
     }
+    const mode = args.mode === "steer" || args.mode === "followUp" ? args.mode : "auto";
+    if (!opts.fromHeld && queuedBusy() && this.adapter.alive && this.shouldHold(mode)) {
+      return this.enqueueHeld(text, imagePaths, args.from);
+    }
     if (this.state.phase === "exited" || (this.state.phase === "error" && !this.adapter.alive)) {
       this.start(this.state.sessionFile);
       await this.whenReady(30_000);
     }
     if (this.state.phase === "starting") await this.whenReady(30_000);
     const agent = this.requireAgent();
+    if (queuedBusy() && this.shouldHold(mode)) {
+      return this.enqueueHeld(text, imagePaths, args.from);
+    }
     let message = text;
-    let images: ImageBlock[] = imagePaths.length ? (await loadImages(imagePaths)).map((i) => ({ data: i.data, mimeType: i.mimeType })) : [];
+    let images: ImageBlock[] = [];
+    const reserved = imagePaths.length > 0 && !this.busy && !this.sendPreparing;
+    if (reserved) this.sendPreparing = true;
+    try {
+      if (imagePaths.length) images = (await loadImages(imagePaths)).map((i) => ({ data: i.data, mimeType: i.mimeType }));
+    } catch (e) {
+      if (reserved) {
+        this.sendPreparing = false;
+        this.drainHeld();
+      }
+      throw e;
+    }
+    if (reserved) this.sendPreparing = false;
+    if (queuedBusy() && this.shouldHold(mode)) {
+      return this.enqueueHeld(text, imagePaths, args.from);
+    }
     if (images.length && !this.state.capabilities.images) {
       message += (message ? "\n\n" : "") + imagePaths.map((p) => `[Image available at: ${p}]`).join("\n");
       images = [];
     }
-    const mode = args.mode === "steer" || args.mode === "followUp" ? args.mode : "auto";
     const working = this.busy;
     const source: UserSource = working ? "queued" : args.source ?? "composer";
     // The message is on the timeline at once (the agent may echo it seconds later, when its turn starts); the echo confirms it.
@@ -1199,6 +1230,7 @@ export class Chat {
       if (isCommand) this.clearCommandHint();
       undo();
       opts.onRejected?.(answeredPending || exited(e));
+      if (!this.busy) this.returnHeld();
       if (!exited(e)) {
         this.toast("error", errText(e));
         this.notice("error", `${this.agent} rejected the message: ${errText(e)}`);
@@ -1295,6 +1327,9 @@ export class Chat {
   /** queue_move: the row's ⇄. A follow-up becomes a steer now; a steer the agent gives back waits for the run's end. */
   async queueMove(id: string, to: string): Promise<Record<string, never>> {
     if (to !== "steer" && to !== "followUp") throw new Error("queue_move needs `to`: \"steer\" or \"followUp\"");
+    if (to === "steer" && !this.state.capabilities.steer) {
+      throw new Error(`${this.agent} can't steer mid-run: queued messages go after this run.`);
+    }
     const inLane = to === "steer" ? this.agentQueue.steeringIds?.includes(id) : this.held.some((h) => h.id === id) || this.agentQueue.followUpIds?.includes(id);
     if (inLane) return {};
     const m = await this.takeQueued(id);

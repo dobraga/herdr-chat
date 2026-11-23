@@ -5,8 +5,10 @@
 // Claude Code: cancel_async_message; Codex: not at all).
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { chmodSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import { deflateSync, crc32 } from "node:zlib";
 import { startHost, idle, sleep } from "./harness.ts";
 import type { Host } from "./harness.ts";
@@ -257,6 +259,111 @@ test("reconnect (pi): a client that connects mid-run sees the held follow-ups in
     assert.deepEqual(restored, ["fu held"]);
     h.client = d;
     h.artifact("queue-reconnect");
+  } finally {
+    await h.stop();
+  }
+});
+
+const FAKE_AGY = resolve(fileURLToPath(new URL("../fake-agy/fake-agy.mjs", import.meta.url)));
+chmodSync(FAKE_AGY, 0o755);
+
+async function agyHost(name: string): Promise<Host> {
+  const h = await startHost({
+    name,
+    provider: "agy",
+    agent: FAKE_AGY,
+    env: { AGY_SETTINGS_PATH: join(tmpdir(), `herdr-chat-nonexistent-${name}-${Date.now()}.json`) },
+  });
+  await h.client.waitFor(idle, 10_000);
+  return h;
+}
+
+test("auto-queue (agy): Enter (mode: auto) while working queues multiple messages in state.queue.followUp and drains FIFO without error", async () => {
+  const h = await agyHost("q-agy-auto");
+  try {
+    const c = h.client;
+    await c.req("send", { text: "SLOW first" });
+    await c.waitFor(running, 5000, "tool running");
+    assert.equal((await c.req("send", { text: "ECHO: second" })).disposition, "queued");
+    assert.equal((await c.req("send", { text: "ECHO: third", mode: "auto" })).disposition, "queued");
+    await c.waitFor((x) => x.state.queue.followUp.length === 2, 2000, "two queued");
+    assert.deepEqual(c.state.queue.followUp, ["ECHO: second", "ECHO: third"]);
+    assert.deepEqual(c.state.queue.steering, []);
+    assert.deepEqual(c.state.queue.followUpRemovable, [true, true]);
+    assert.ok(!c.items.some((i: any) => i.kind === "notice" && i.level === "error"), "no error notices while queued");
+    await c.waitFor(answered(/^ok: third/), 10_000, "all answered FIFO");
+    assert.deepEqual(users(c), ["composer:SLOW first", "queued:ECHO: second", "queued:ECHO: third"]);
+    assert.deepEqual(c.state.queue, { steering: [], followUp: [] });
+    assert.ok(!c.items.some((i: any) => i.kind === "notice" && i.level === "error"), "no error notices after drain");
+    assert.ok(!c.items.some((i: any) => i.kind === "notice" && /on its own/.test(i.text)), "queued runs are not autonomous");
+    await h.waitStatus(/^done/);
+    assert.deepEqual(runs(h), ["idle", "working", "done"]);
+    h.artifact("queue-agy-auto");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("queue ops (agy): remove and edit work; move to steer rejects without dropping the message", async () => {
+  const h = await agyHost("q-agy-ops");
+  try {
+    const c = h.client;
+    await c.req("send", { text: "SLOW work" });
+    await c.waitFor(running, 5000, "tool running");
+    await c.req("send", { text: "ECHO: keep" });
+    await c.req("send", { text: "ECHO: drop" });
+    await c.req("send", { text: "ECHO: edit" });
+    await c.waitFor((x) => x.state.queue.followUp.length === 3, 2000, "three queued");
+    const [keep, drop, edit] = c.state.queue.followUpIds;
+    await assert.rejects(c.req("queue_move", { message: keep, to: "steer" }), /can't steer/);
+    assert.deepEqual(c.state.queue.followUp, ["ECHO: keep", "ECHO: drop", "ECHO: edit"]);
+    await c.req("queue_remove", { message: drop });
+    await c.waitFor((x) => x.state.queue.followUp.length === 2, 2000, "removed");
+    const back = await c.req("queue_edit", { message: edit });
+    assert.deepEqual(back, { text: "ECHO: edit", images: [] });
+    await c.waitFor((x) => x.state.queue.followUp.length === 1, 2000, "edited out");
+    await c.waitFor(answered(/^ok: keep/), 10_000, "keep answered");
+    await sleep(250);
+    assert.deepEqual(users(c), ["composer:SLOW work", "queued:ECHO: keep"]);
+    h.artifact("queue-agy-ops");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("abort (agy): queued messages come back in restored and are never sent", async () => {
+  const h = await agyHost("q-agy-abort");
+  try {
+    const c = h.client;
+    await c.req("send", { text: "HANG" });
+    await c.waitFor((x) => x.state.phase === "working" && x.items.some((i: any) => i.kind === "thinking"), 5000, "thinking streaming");
+    await c.req("send", { text: "ECHO: after 1" });
+    await c.req("send", { text: "ECHO: after 2" });
+    await c.waitFor((x) => x.state.queue.followUp.length === 2, 2000, "two queued");
+    const { restored } = await c.req("abort");
+    assert.deepEqual(restored, ["ECHO: after 1", "ECHO: after 2"]);
+    await c.waitFor(idle, 5000, "idle after abort");
+    await sleep(300);
+    assert.deepEqual(c.state.queue, { steering: [], followUp: [] });
+    assert.deepEqual(users(c), ["composer:HANG"]);
+    h.artifact("queue-agy-abort");
+  } finally {
+    await h.stop();
+  }
+});
+
+test("hc send (agy): external message while busy queues with sender instead of erroring", async () => {
+  const h = await agyHost("q-agy-hc-send");
+  try {
+    const c = h.client;
+    await c.req("send", { text: "SLOW work" });
+    await c.waitFor(running, 5000, "tool running");
+    h.writeStdin('\u001b[200~<hc from="t9 tests">ECHO: report ready</hc>\u001b[201~\r');
+    await c.waitFor((x) => x.state.queue.followUp.length === 1, 2000, "external queued");
+    assert.equal(c.state.queue.followUpFrom?.[0], "t9 tests");
+    await c.waitFor(answered(/^ok: report ready/), 10_000, "report answered");
+    assert.ok(!c.items.some((i: any) => i.kind === "notice" && i.level === "error"), "no error notices");
+    h.artifact("queue-agy-hc-send");
   } finally {
     await h.stop();
   }
